@@ -14,9 +14,12 @@ Jimmy Fjällid
 */
 
 import (
+	"syscall"
+
 	log "github.com/jfjallid/golog"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/sys/unix"
+
+	//"golang.org/x/sys/unix"
 
 	"crypto/rand"
 	"crypto/rsa"
@@ -29,10 +32,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
+	//"os/signal"
 	"regexp"
 	"strconv"
 	"sync"
+    "time"
 )
 
 var (
@@ -43,6 +47,8 @@ var (
 //go:embed authorized_keys
 var authorizedKeysBytes []byte
 
+const MYSIGWINCH = syscall.Signal(0x11c)
+
 type Client struct {
 	conn            ssh.Conn
 	identifier      string
@@ -50,12 +56,20 @@ type Client struct {
 	pts             *os.File
 	sessionChan     ssh.Channel
 	term            string
-	ws              *unix.Winsize
+	ws              *winsize
 	wsch            chan os.Signal
 	oncePTYClose    sync.Once
 	reverseForwards map[string]net.Listener
 }
 
+type winsize struct {
+    Row     uint16
+    Col     uint16
+    Xpixel  uint16
+    Ypixel  uint16
+}
+
+// RFC 4254 Section 6.2
 type ptyRequestMsg struct {
 	Term     string
 	Columns  uint32
@@ -65,19 +79,12 @@ type ptyRequestMsg struct {
 	Modelist string
 }
 
-// RFC 4254 Section 7.2
-type reverseForwardChannelData struct {
-	DestHost   string
-	DestPort   uint32
-	OriginHost string
-	OriginPort uint32
-}
-
-type localForwardChannelData struct {
-	DestHost   string
-	DestPort   uint32
-	OriginHost string
-	OriginPort uint32
+// RFC 4254 Section 6.7
+type winsizeChangeMsg struct {
+    cols    uint32
+    rows    uint32
+    width   uint32
+    height  uint32
 }
 
 // RFC 4254 Section 7.1
@@ -95,60 +102,28 @@ type reverseForwardSuccess struct {
 	BindPort uint32
 }
 
-func newPTY() (ptm, pts *os.File, err error) {
-	ptm, err = os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
-	if err != nil {
-		log.Errorln("Failed to open /dev/ptmx: ", err)
-		return
-	}
-	// If we fail we should attempt to close the PTY
-	defer func() {
-		if err != nil {
-			ptm.Close()
-		}
-	}()
-
-	// Get path to PTS
-	sname, err := ptsname(ptm)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
-	err = unlockpt(ptm)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	pts, err = os.OpenFile(sname, os.O_RDWR|unix.O_NOCTTY, 0)
-	if err != nil {
-		log.Errorf("Failed to open %s with error: %v", sname, err)
-		return
-	}
-
-	return
+// RFC 4254 Section 7.2
+type reverseForwardChannelData struct {
+	DestHost   string
+	DestPort   uint32
+	OriginHost string
+	OriginPort uint32
 }
 
-func ptsname(f *os.File) (sname string, err error) {
-	//log.Debugf("Attempting to get ptsname of slave PTS for PTM: %s with FD: %d\n", f.Name(), int(f.Fd()))
-	fd, err := unix.IoctlGetInt(int(f.Fd()), unix.TIOCGPTN)
-	if err != nil {
-		log.Errorf("Failed on ioctl(2) to get file descriptor of PTS: %v", err)
-		return "", err
-	}
-	sname = "/dev/pts/" + strconv.Itoa(fd)
-	//log.Debugf("PTS has sname: %s\n", sname)
-	return
+type localForwardChannelData struct {
+	DestHost   string
+	DestPort   uint32
+	OriginHost string
+	OriginPort uint32
 }
 
-func unlockpt(f *os.File) (err error) {
-	ret, err := unix.IoctlGetInt(int(f.Fd()), unix.TIOCSPTLCK)
-	if (err == nil) && (ret != 0) {
-		log.Errorf("Received no error but return code was non-zero which, indicates an error?")
-		err = fmt.Errorf("nil error but non-zero return code. Strange")
-	}
-	return
+func watchdog(duration time.Duration) {
+	t := time.NewTimer(duration)
+	<-t.C
+	log.Infoln("Watchdog fired! Exiting process")
+	os.Exit(0)
 }
+
 
 func (self *Client) execCommand(payload []byte) {
 	defer func() {
@@ -162,8 +137,10 @@ func (self *Client) execCommand(payload []byte) {
 	}
 
 	log.Debugf("Client '%s': Received request to execute command: %s\n", self.identifier, payloadCmd)
-	cmd, err := self.runCommand([]string{payloadCmd})
+    var cmd *exec.Cmd
+    var err error
 	if self.pts != nil {
+	    cmd, err = self.runPTYCommand([]string{payloadCmd})
 		// Close PTY
 		defer func() {
 			self.oncePTYClose.Do(func() {
@@ -177,12 +154,14 @@ func (self *Client) execCommand(payload []byte) {
 		defer func() {
 			if self.wsch != nil {
 				log.Debugf("Client '%s': Closing wsch chan\n", self.identifier)
-				signal.Stop(self.wsch)
+				//signal.Stop(self.wsch) //NOTE Needed?
 				close(self.wsch)
 			}
 		}()
 
-	}
+	} else {
+	    cmd, err = self.runCommand([]string{payloadCmd})
+    }
 	err = cmd.Wait()
 
 	if err != nil {
@@ -191,143 +170,115 @@ func (self *Client) execCommand(payload []byte) {
 	log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
 }
 
-func (self *Client) spawnShell() {
-	cmd, err := self.runCommand([]string{})
-	defer func() {
-		cmd = nil
-	}()
+func (self *Client) spawnShell() (res bool, reply []byte) {
+    var cmd *exec.Cmd
+    var err error
+    if self.pts != nil {
+	    cmd, err = self.runPTYCommand([]string{})
+    } else {
+	    cmd, err = self.runCommand([]string{})
+    }
+    if err != nil {
+        log.Errorf("Client '%s': Failed to spawn shell: %v\n", self.identifier, err)
+        reply = []byte(fmt.Sprintf("Failed to spawn shell: %v", err))
+        return
+    }
+    //log.Debugf("cmd: %v\n", cmd)
+    //log.Debugf("cmd pid: %d\n", cmd.Process.Pid)
 
-	// Close session
-	defer func() {
-		self.sessionChan.Close()
-	}()
+    go func() {
+	    defer func() {
+            //log.Debugln("Setting cmd = nil")
+	    	cmd = nil
+	    }()
 
-	if self.pts != nil {
-		// Close PTY
-		defer func() {
-			self.oncePTYClose.Do(func() {
-				self.ptm.Close()
-				self.pts.Close()
-				self.ptm = nil
-				self.pts = nil
-			})
-			log.Debugf("Client '%s': Closed PTY\n", self.identifier)
-		}()
+	    // Close session
+	    defer func() {
+	    	self.sessionChan.Close()
+	    }()
 
-		defer func() {
-			signal.Stop(self.wsch)
-			close(self.wsch)
-		}()
-	}
-	err = cmd.Wait()
-	if err != nil {
-		log.Errorf("Client '%s': Shell process exit error: %v\n", self.identifier, err)
-	}
-	log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
+	    if self.pts != nil {
+	    	// Close PTY
+	    	defer func() {
+	    		self.oncePTYClose.Do(func() {
+	    			self.ptm.Close()
+	    			self.pts.Close()
+	    			self.ptm = nil
+	    			self.pts = nil
+	    		})
+	    		log.Debugf("Client '%s': Closed PTY\n", self.identifier)
+	    	}()
+
+	    	defer func() {
+	    		//signal.Stop(self.wsch) //NOTE needed?
+	    		close(self.wsch)
+	    	}()
+	    }
+
+	    err = cmd.Wait()
+	    if err != nil {
+	    	log.Errorf("Client '%s': Shell process exit error: %v\n", self.identifier, err)
+	    }
+	    log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
+    }()
+    res = true
 	return
 }
 
 func (self *Client) runCommand(args []string) (cmd *exec.Cmd, err error) {
 	if len(args) == 0 {
 		// No args so a normal shell
-		if self.pts != nil {
-			cmd = exec.Command("/bin/bash", "-i")
-		} else {
-			cmd = exec.Command("/bin/sh")
-		}
+		cmd = exec.Command(NON_PTY_SHELL)
 	} else {
-		args = append([]string{"-c"}, args...)
-		if self.pts != nil {
-			cmd = exec.Command("/bin/bash", args...)
-		} else {
-			cmd = exec.Command("/bin/sh", args...)
-		}
+		args = append([]string{NON_PTY_EXEC_FLAG}, args...)
+		cmd = exec.Command(NON_PTY_EXEC, args...)
 	}
 
-	if self.pts != nil {
-		cmd.Env = append(cmd.Environ(), self.term)
-		cmd.Stdout = self.pts
-		cmd.Stderr = self.pts
-		cmd.Stdin = self.pts
-		// Setting Setsid and Setctty to connect PTS to process properly with a process group
-		cmd.SysProcAttr = &unix.SysProcAttr{
-			Setsid:  true,
-			Setctty: true,
-		}
-		go func() {
-			io.Copy(self.sessionChan, self.ptm)
-			log.Debugf("Client '%s': Stopped io.Copy from PTY to session channel", self.identifier)
-		}()
-		go func() {
-			io.Copy(self.ptm, self.sessionChan)
-			log.Debugf("Client '%s': Stopped io.Copy from session channel to PTY", self.identifier)
-		}()
-		err = cmd.Start()
-		if err != nil {
-			log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
-			return
-		}
-		self.wsch = make(chan os.Signal, 1)
-		signal.Notify(self.wsch, unix.SIGWINCH)
-		go func() {
-			for range self.wsch {
-				err := unix.IoctlSetWinsize(int(self.pts.Fd()), unix.TIOCSWINSZ, self.ws)
-				if err != nil {
-					log.Errorf("Client '%s': Failed to resize pty of process: %v\n", self.identifier, err)
-				}
-				if (cmd != nil) && (cmd.Process != nil) {
-					cmd.Process.Signal(unix.SIGWINCH)
-				}
-			}
-		}()
-		// Send initial resize
-		self.wsch <- unix.SIGWINCH
-
-	} else {
-		var stdinPipe io.WriteCloser
-		var stdoutPipe, stderrPipe io.ReadCloser
-		stdinPipe, err = cmd.StdinPipe()
-		if err != nil {
-			log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
-			return
-		}
-		stdoutPipe, err = cmd.StdoutPipe()
-		if err != nil {
-			log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
-			return
-		}
-		stderrPipe, err = cmd.StderrPipe()
-		if err != nil {
-			log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
-			return
-		}
-		go func() {
-			io.Copy(self.sessionChan, stdoutPipe)
-			log.Debugf("Client '%s': Stopped io.Copy from stdoutPipe to session channel", self.identifier)
-		}()
-		go func() {
-			io.Copy(self.sessionChan, stderrPipe)
-			log.Debugf("Client '%s': Stopped io.Copy from stderrPipe to session channel", self.identifier)
-		}()
-		go func() {
-			io.Copy(stdinPipe, self.sessionChan)
-			log.Debugf("Client '%s': Stopped io.Copy from session channel to stdinPipe", self.identifier)
-			// Probably means client pressed ctrl-d so exit process to prevent hanging connection
-			cmd.Process.Signal(unix.SIGTERM)
-		}()
-
-		// If using self.sessionChan directly, the process hangs after completion until any data is sent on stdin
-		// Has something to do with self.sessionChan not being an *os.File and thus cmd.Exec behaves strangely.
-		// Can solve it by using a pipe.
-		//cmd.Stdin = self.sessionChan
-		//cmd.Stdout = self.sessionChan
-		//cmd.Stderr = self.sessionChan
-		err = cmd.Start()
-		if err != nil {
-			log.Infof("Client '%s': Error: %v\n", self.identifier, err)
-			return
-		}
+	var stdinPipe io.WriteCloser
+	var stdoutPipe, stderrPipe io.ReadCloser
+	stdinPipe, err = cmd.StdinPipe()
+	if err != nil {
+		log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
+		return
 	}
+	stdoutPipe, err = cmd.StdoutPipe()
+	if err != nil {
+		log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
+		return
+	}
+	stderrPipe, err = cmd.StderrPipe()
+	if err != nil {
+		log.Errorf("Client '%s': Error: %v\n", self.identifier, err)
+		return
+	}
+
+	// If using self.sessionChan directly, the process hangs after completion until any data is sent on stdin
+	// Has something to do with self.sessionChan not being an *os.File and thus cmd.Exec behaves strangely.
+	// Can solve it by using a pipe.
+	//cmd.Stdin = self.sessionChan
+	//cmd.Stdout = self.sessionChan
+	//cmd.Stderr = self.sessionChan
+	err = cmd.Start()
+	if err != nil {
+		log.Infof("Client '%s': Error: %v\n", self.identifier, err)
+		return
+	}
+	go func() {
+		io.Copy(self.sessionChan, stdoutPipe)
+		log.Debugf("Client '%s': Stopped io.Copy from stdoutPipe to session channel", self.identifier)
+	}()
+	go func() {
+		io.Copy(self.sessionChan, stderrPipe)
+		log.Debugf("Client '%s': Stopped io.Copy from stderrPipe to session channel", self.identifier)
+	}()
+	go func() {
+		io.Copy(stdinPipe, self.sessionChan)
+		log.Debugf("Client '%s': Stopped io.Copy from session channel to stdinPipe", self.identifier)
+		// Probably means client pressed ctrl-d so exit process to prevent hanging connection
+		//cmd.Process.Signal(unix.SIGTERM)
+		cmd.Process.Signal(syscall.SIGKILL)
+	}()
+
 	return
 }
 
@@ -336,24 +287,32 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 	for req := range in {
 		switch req.Type {
 		case "pty-req":
-			termLen := req.Payload[3]
-			termEnv := string(req.Payload[4 : termLen+4])
-			log.Debugf("Client '%s': Received request to allocated a PTY with term: %s\n", self.identifier, termEnv)
+            pr := ptyRequestMsg{}
+	        if err := ssh.Unmarshal(req.Payload, &pr); err != nil {
+			    log.Errorf("Client '%s': Failed to parse pty-req payload: %v\n", self.identifier, err)
+                req.Reply(false, nil)
+                continue
+	        }
+			log.Debugf("Client '%s': Received request to allocated a PTY with term: %s\n", self.identifier, pr.Term)
 			if self.ptm != nil {
 				log.Noticef("Client '%s': Received another request to spawn pty. Ignoring.\n", self.identifier)
 				req.Reply(false, nil)
 				continue
 			}
 			// Sanity check of the passed term
-			if termRegex.MatchString(termEnv) {
-				self.term = "TERM=" + termEnv
+			if termRegex.MatchString(pr.Term) {
+				self.term = "TERM=" + pr.Term
 			} else {
-				log.Infof("Client '%s': Received invalid TERM variable from client: %s\n", self.identifier, termEnv)
+				log.Infof("Client '%s': Received invalid TERM variable from client: %s\n", self.identifier, pr.Term)
 				self.term = "TERM=xterm"
 			}
-			ws := &unix.Winsize{}
-			ws.Col = uint16(binary.BigEndian.Uint32(req.Payload[termLen+4:]))
-			ws.Row = uint16(binary.BigEndian.Uint32(req.Payload[termLen+4+4:]))
+			//ws := &unix.Winsize{}
+            ws := &winsize{
+                Col: uint16(pr.Columns),
+                Row: uint16(pr.Rows),
+                Xpixel: uint16(pr.Width),
+                Ypixel: uint16(pr.Height),
+            }
 			self.ws = ws
 
 			ptm, pts, err := newPTY()
@@ -374,8 +333,9 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 			req.Reply(true, nil)
 		case "shell":
 			log.Debugf("Client '%s': Received request to spawn shell\n", self.identifier)
-			req.Reply(true, nil)
-			go self.spawnShell()
+            log.Debugln(req)
+			//req.Reply(true, nil)
+			req.Reply(self.spawnShell())
 		case "window-change":
 			if self.ws == nil {
 				log.Noticef("Client '%s': Unexpected window-change request before pty-req. Ignoring\n", self.identifier)
@@ -384,7 +344,8 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 			// Read dimensions from payload
 			self.ws.Col = uint16(binary.BigEndian.Uint32(req.Payload[0:4]))
 			self.ws.Row = uint16(binary.BigEndian.Uint32(req.Payload[4:8]))
-			self.wsch <- unix.SIGWINCH
+			//self.wsch <- syscall.SIGWINCH
+			self.wsch <- MYSIGWINCH
 		case "exec":
 			log.Debugf("Client '%s': Received exec request: %v\n", self.identifier, req)
 			go self.execCommand(req.Payload)
@@ -652,6 +613,13 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 }
 
 func main() {
+	watchdogDuration, err := time.ParseDuration("168h")
+    if err != nil {
+        log.Criticalln(err)
+        return
+    }
+    go watchdog(watchdogDuration)
+
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetLogLevel(6)
 	// Public key authentication is done by comparing the public key of a
@@ -676,14 +644,14 @@ func main() {
 
 	config := &ssh.ServerConfig{
 		// Remove to disable password auth.
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			// Should use constant-time compare (or better, salt+hash) in
-			// a production setting.
-			if c.User() == "user" && string(pass) == "tiger" {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("password rejected for %q", c.User())
-		},
+		//PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+		//	// Should use constant-time compare (or better, salt+hash) in
+		//	// a production setting.
+		//	if c.User() == "user" && string(pass) == "tiger" {
+		//		return nil, nil
+		//	}
+		//	return nil, fmt.Errorf("password rejected for %q", c.User())
+		//},
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			if authorizedKeysMap[string(pubKey.Marshal())] {
 				return &ssh.Permissions{
