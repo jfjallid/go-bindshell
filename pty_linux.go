@@ -2,13 +2,13 @@ package main
 
 import (
 	log "github.com/jfjallid/golog"
-    "os"
-    "os/exec"
-    //"os/signal"
-    "golang.org/x/sys/unix"
-    "strconv"
-    "fmt"
-    "io"
+	"os"
+	"os/exec"
+	//"os/signal"
+	"fmt"
+	"golang.org/x/sys/unix"
+	"io"
+	"strconv"
 )
 
 func newPTY() (ptm, pts *os.File, err error) {
@@ -101,7 +101,7 @@ func (self *Client) runPTYCommand(args []string) (cmd *exec.Cmd, err error) {
 	//signal.Notify(self.wsch, unix.SIGWINCH) //NOTE Needed?
 	go func() {
 		for range self.wsch {
-            unixWS := unix.Winsize{Row: self.ws.Row, Col: self.ws.Col, Xpixel: self.ws.Xpixel, Ypixel: self.ws.Ypixel}
+			unixWS := unix.Winsize{Row: self.ws.Row, Col: self.ws.Col, Xpixel: self.ws.Xpixel, Ypixel: self.ws.Ypixel}
 			err := unix.IoctlSetWinsize(int(self.pts.Fd()), unix.TIOCSWINSZ, &unixWS)
 			if err != nil {
 				log.Errorf("Client '%s': Failed to resize pty of process: %v\n", self.identifier, err)
@@ -116,4 +116,3 @@ func (self *Client) runPTYCommand(args []string) (cmd *exec.Cmd, err error) {
 
 	return
 }
-

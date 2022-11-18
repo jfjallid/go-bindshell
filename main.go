@@ -2,7 +2,7 @@ package main
 
 /*
 An authenticated bind shell using SSH and public key authentication
-with support for port forwarding.
+with support for dynamic (socks) and static port forwarding
 Due to some dependencies on spawning a PTY, this will only work on linux
 distributions. Limitations are in the opening of the /dev/ptmx device.
 
@@ -14,12 +14,11 @@ Jimmy Fjällid
 */
 
 import (
+	"strings"
 	"syscall"
 
 	log "github.com/jfjallid/golog"
 	"golang.org/x/crypto/ssh"
-
-	//"golang.org/x/sys/unix"
 
 	"crypto/rand"
 	"crypto/rsa"
@@ -32,11 +31,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	//"os/signal"
 	"regexp"
 	"strconv"
 	"sync"
-    "time"
+	"time"
 )
 
 var (
@@ -50,23 +48,24 @@ var authorizedKeysBytes []byte
 const MYSIGWINCH = syscall.Signal(0x11c)
 
 type Client struct {
-	conn            ssh.Conn
-	identifier      string
-	ptm             *os.File
-	pts             *os.File
-	sessionChan     ssh.Channel
-	term            string
-	ws              *winsize
-	wsch            chan os.Signal
-	oncePTYClose    sync.Once
-	reverseForwards map[string]net.Listener
+	conn                    ssh.Conn
+	identifier              string
+	ptm                     *os.File
+	pts                     *os.File
+	sessionChan             ssh.Channel
+	term                    string
+	ws                      *winsize
+	wsch                    chan os.Signal
+	oncePTYClose            sync.Once
+	reverseForwards         map[string]net.Listener
+	reverseForwardListeners map[net.Listener]string
 }
 
 type winsize struct {
-    Row     uint16
-    Col     uint16
-    Xpixel  uint16
-    Ypixel  uint16
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
 }
 
 // RFC 4254 Section 6.2
@@ -81,10 +80,10 @@ type ptyRequestMsg struct {
 
 // RFC 4254 Section 6.7
 type winsizeChangeMsg struct {
-    cols    uint32
-    rows    uint32
-    width   uint32
-    height  uint32
+	cols   uint32
+	rows   uint32
+	width  uint32
+	height uint32
 }
 
 // RFC 4254 Section 7.1
@@ -124,7 +123,6 @@ func watchdog(duration time.Duration) {
 	os.Exit(0)
 }
 
-
 func (self *Client) execCommand(payload []byte) {
 	defer func() {
 		self.sessionChan.Close()
@@ -137,10 +135,10 @@ func (self *Client) execCommand(payload []byte) {
 	}
 
 	log.Debugf("Client '%s': Received request to execute command: %s\n", self.identifier, payloadCmd)
-    var cmd *exec.Cmd
-    var err error
+	var cmd *exec.Cmd
+	var err error
 	if self.pts != nil {
-	    cmd, err = self.runPTYCommand([]string{payloadCmd})
+		cmd, err = self.runPTYCommand([]string{payloadCmd})
 		// Close PTY
 		defer func() {
 			self.oncePTYClose.Do(func() {
@@ -160,8 +158,8 @@ func (self *Client) execCommand(payload []byte) {
 		}()
 
 	} else {
-	    cmd, err = self.runCommand([]string{payloadCmd})
-    }
+		cmd, err = self.runCommand([]string{payloadCmd})
+	}
 	err = cmd.Wait()
 
 	if err != nil {
@@ -171,57 +169,57 @@ func (self *Client) execCommand(payload []byte) {
 }
 
 func (self *Client) spawnShell() (res bool, reply []byte) {
-    var cmd *exec.Cmd
-    var err error
-    if self.pts != nil {
-	    cmd, err = self.runPTYCommand([]string{})
-    } else {
-	    cmd, err = self.runCommand([]string{})
-    }
-    if err != nil {
-        log.Errorf("Client '%s': Failed to spawn shell: %v\n", self.identifier, err)
-        reply = []byte(fmt.Sprintf("Failed to spawn shell: %v", err))
-        return
-    }
-    //log.Debugf("cmd: %v\n", cmd)
-    //log.Debugf("cmd pid: %d\n", cmd.Process.Pid)
+	var cmd *exec.Cmd
+	var err error
+	if self.pts != nil {
+		cmd, err = self.runPTYCommand([]string{})
+	} else {
+		cmd, err = self.runCommand([]string{})
+	}
+	if err != nil {
+		log.Errorf("Client '%s': Failed to spawn shell: %v\n", self.identifier, err)
+		reply = []byte(fmt.Sprintf("Failed to spawn shell: %v", err))
+		return
+	}
+	//log.Debugf("cmd: %v\n", cmd)
+	//log.Debugf("cmd pid: %d\n", cmd.Process.Pid)
 
-    go func() {
-	    defer func() {
-            //log.Debugln("Setting cmd = nil")
-	    	cmd = nil
-	    }()
+	go func() {
+		defer func() {
+			//log.Debugln("Setting cmd = nil")
+			cmd = nil
+		}()
 
-	    // Close session
-	    defer func() {
-	    	self.sessionChan.Close()
-	    }()
+		// Close session
+		defer func() {
+			self.sessionChan.Close()
+		}()
 
-	    if self.pts != nil {
-	    	// Close PTY
-	    	defer func() {
-	    		self.oncePTYClose.Do(func() {
-	    			self.ptm.Close()
-	    			self.pts.Close()
-	    			self.ptm = nil
-	    			self.pts = nil
-	    		})
-	    		log.Debugf("Client '%s': Closed PTY\n", self.identifier)
-	    	}()
+		if self.pts != nil {
+			// Close PTY
+			defer func() {
+				self.oncePTYClose.Do(func() {
+					self.ptm.Close()
+					self.pts.Close()
+					self.ptm = nil
+					self.pts = nil
+				})
+				log.Debugf("Client '%s': Closed PTY\n", self.identifier)
+			}()
 
-	    	defer func() {
-	    		//signal.Stop(self.wsch) //NOTE needed?
-	    		close(self.wsch)
-	    	}()
-	    }
+			defer func() {
+				//signal.Stop(self.wsch) //NOTE needed?
+				close(self.wsch)
+			}()
+		}
 
-	    err = cmd.Wait()
-	    if err != nil {
-	    	log.Errorf("Client '%s': Shell process exit error: %v\n", self.identifier, err)
-	    }
-	    log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
-    }()
-    res = true
+		err = cmd.Wait()
+		if err != nil {
+			log.Errorf("Client '%s': Shell process exit error: %v\n", self.identifier, err)
+		}
+		log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
+	}()
+	res = true
 	return
 }
 
@@ -287,12 +285,12 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 	for req := range in {
 		switch req.Type {
 		case "pty-req":
-            pr := ptyRequestMsg{}
-	        if err := ssh.Unmarshal(req.Payload, &pr); err != nil {
-			    log.Errorf("Client '%s': Failed to parse pty-req payload: %v\n", self.identifier, err)
-                req.Reply(false, nil)
-                continue
-	        }
+			pr := ptyRequestMsg{}
+			if err := ssh.Unmarshal(req.Payload, &pr); err != nil {
+				log.Errorf("Client '%s': Failed to parse pty-req payload: %v\n", self.identifier, err)
+				req.Reply(false, nil)
+				continue
+			}
 			log.Debugf("Client '%s': Received request to allocated a PTY with term: %s\n", self.identifier, pr.Term)
 			if self.ptm != nil {
 				log.Noticef("Client '%s': Received another request to spawn pty. Ignoring.\n", self.identifier)
@@ -307,12 +305,12 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 				self.term = "TERM=xterm"
 			}
 			//ws := &unix.Winsize{}
-            ws := &winsize{
-                Col: uint16(pr.Columns),
-                Row: uint16(pr.Rows),
-                Xpixel: uint16(pr.Width),
-                Ypixel: uint16(pr.Height),
-            }
+			ws := &winsize{
+				Col:    uint16(pr.Columns),
+				Row:    uint16(pr.Rows),
+				Xpixel: uint16(pr.Width),
+				Ypixel: uint16(pr.Height),
+			}
 			self.ws = ws
 
 			ptm, pts, err := newPTY()
@@ -333,7 +331,7 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 			req.Reply(true, nil)
 		case "shell":
 			log.Debugf("Client '%s': Received request to spawn shell\n", self.identifier)
-            log.Debugln(req)
+			//log.Debugln(req)
 			//req.Reply(true, nil)
 			req.Reply(self.spawnShell())
 		case "window-change":
@@ -376,6 +374,7 @@ func (self *Client) handleReverseForward(l net.Listener) {
 			log.Errorf("Client '%s': Error %v\n", self.identifier, err)
 			continue
 		}
+		//bindAddr, bindPortStr, err := net.SplitHostPort(l.Addr().String())
 		bindAddr, bindPortStr, err := net.SplitHostPort(l.Addr().String())
 		if err != nil {
 			// Can this ever happen?
@@ -389,6 +388,13 @@ func (self *Client) handleReverseForward(l net.Listener) {
 			log.Errorf("Client '%s': Error %v\n", self.identifier, err)
 			conn.Close()
 			continue
+		}
+		if val, ok := self.reverseForwardListeners[l]; ok {
+			// Use configured bindAddr instead of the one translated by net lib.
+			// l.Addr() returns 127.0.0.1:1234 instead of localhost:1234 even
+			// if localhost // was specified as listen address.
+			// Important for reverse SOCKS.
+			bindAddr = strings.Split(val, ":")[0]
 		}
 
 		originAddr, originPortStr, err := net.SplitHostPort(conn.RemoteAddr().String())
@@ -422,7 +428,14 @@ func (self *Client) handleReverseForward(l net.Listener) {
 			continue
 		}
 		// Don't think I need these?
-		go ssh.DiscardRequests(reqs)
+		//go ssh.DiscardRequests(reqs)
+		go func(in <-chan *ssh.Request) {
+			for req := range in {
+				log.Debugf("Denying received request: %v\n", req)
+				req.Reply(false, nil)
+			}
+		}(reqs)
+
 		go func() {
 			defer channel.Close()
 			defer conn.Close()
@@ -468,13 +481,13 @@ func (c *Client) handleForward(newChannel ssh.NewChannel) {
 		dconn.Close()
 		return
 	}
-	go ssh.DiscardRequests(requests)
-	//go func (in <-chan *ssh.Request) {
-	//    for req := range in {
-	//        log.Debugf("Received request: %v\n", req)
-	//        req.Reply(false, nil)
-	//    }
-	//}(requests)
+	//go ssh.DiscardRequests(requests)
+	go func(in <-chan *ssh.Request) {
+		for req := range in {
+			log.Debugf("Denying received request: %v\n", req)
+			req.Reply(false, nil)
+		}
+	}(requests)
 
 	go func() {
 		defer channel.Close()
@@ -582,6 +595,7 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 			// Must close listener if shutdown before receiving cancel-tcpip-forward.
 			defer l.Close()
 			self.reverseForwards[listenAddr] = l // Shouldn't need a pointer to an interface
+			self.reverseForwardListeners[l] = listenAddr
 			go self.handleReverseForward(l)
 			payload := ssh.Marshal(&reverseForwardSuccess{uint32(bindPort)})
 			req.Reply(true, payload)
@@ -597,8 +611,9 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 			listenAddr := net.JoinHostPort(r.BindAddr, strconv.FormatInt(int64(r.BindPort), 10))
 			if val, ok := self.reverseForwards[listenAddr]; ok {
 				// Close listener
-				val.Close()
 				delete(self.reverseForwards, listenAddr)
+				delete(self.reverseForwardListeners, val)
+				val.Close()
 				req.Reply(true, nil)
 			} else {
 				req.Reply(false, nil)
@@ -613,15 +628,17 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 }
 
 func main() {
+	// Run max 1 week
 	watchdogDuration, err := time.ParseDuration("168h")
-    if err != nil {
-        log.Criticalln(err)
-        return
-    }
-    go watchdog(watchdogDuration)
+	if err != nil {
+		log.Criticalln(err)
+		return
+	}
+	go watchdog(watchdogDuration)
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetLogLevel(6)
+	log.SetLogLevel(log.LevelNotice)
+	//log.SetLogLevel(log.LevelDebug)
 	// Public key authentication is done by comparing the public key of a
 	// received connection with the entries in the authorized_keys file
 	// included by go:embed authorized_keys
@@ -707,9 +724,10 @@ func main() {
 			continue
 		}
 		c := Client{
-			conn:            conn,
-			identifier:      fmt.Sprintf("%s@%s", conn.User(), conn.RemoteAddr().String()),
-			reverseForwards: make(map[string]net.Listener),
+			conn:                    conn,
+			identifier:              fmt.Sprintf("%s@%s", conn.User(), conn.RemoteAddr().String()),
+			reverseForwards:         make(map[string]net.Listener),
+			reverseForwardListeners: make(map[net.Listener]string),
 		}
 		log.Noticef("Client '%s' logged in with password.", c.identifier)
 		//log.Printf("logged in with key %s", conn.Permissions.Extensions["pubkey-fp"])

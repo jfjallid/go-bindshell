@@ -2,13 +2,13 @@ package main
 
 import (
 	//log "github.com/jfjallid/golog"
-    "os"
-    "os/exec"
-    //"os/signal"
-    //"golang.org/x/sys/windows"
-    //"strconv"
-    "fmt"
-    //"io"
+	"os"
+	"os/exec"
+	//"os/signal"
+	//"golang.org/x/sys/windows"
+	//"strconv"
+	"fmt"
+	//"io"
 )
 
 func newPTY() (ptm, pts *os.File, err error) {
@@ -16,7 +16,7 @@ func newPTY() (ptm, pts *os.File, err error) {
 }
 
 func (self *Client) runPTYCommand(args []string) (cmd *exec.Cmd, err error) {
-    return nil, fmt.Errorf("Running PTY commands are not supported on Windows")
+	return nil, fmt.Errorf("Running PTY commands are not supported on Windows")
 }
 
 /*
