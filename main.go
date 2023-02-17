@@ -628,6 +628,21 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 }
 
 func main() {
+	//    // Don't run after
+	//    longForm := "Jan 2, 2006 at 3:04pm (MST)"
+	//    tPree, err := time.Parse(longForm, "Feb 17, 2023 at 11:45am (CET)")
+	//    if err != nil {
+	//        return
+	//    }
+	//    tAfter, err := time.Parse(longForm, "Feb 17, 2023 at 4:00pm (CET)")
+	//    if err != nil {
+	//        return
+	//    }
+	//    currentTime := time.Now()
+	//    if (currentTime.After(tAfter)) || (currentTime.Before(tPree)) {
+	//        return
+	//    }
+
 	// Run max 1 week
 	watchdogDuration, err := time.ParseDuration("168h")
 	if err != nil {
@@ -661,14 +676,14 @@ func main() {
 
 	config := &ssh.ServerConfig{
 		// Remove to disable password auth.
-		//PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-		//	// Should use constant-time compare (or better, salt+hash) in
-		//	// a production setting.
-		//	if c.User() == "user" && string(pass) == "tiger" {
-		//		return nil, nil
-		//	}
-		//	return nil, fmt.Errorf("password rejected for %q", c.User())
-		//},
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			// Should use constant-time compare (or better, salt+hash) in
+			// a production setting.
+			if c.User() == "user" && string(pass) == "tiger" {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("password rejected for %q", c.User())
+		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			if authorizedKeysMap[string(pubKey.Marshal())] {
 				return &ssh.Permissions{
@@ -678,6 +693,7 @@ func main() {
 					},
 				}, nil
 			}
+			log.Noticef("Unknown public key: %s\n", string(pubKey.Marshal()))
 			return nil, fmt.Errorf("unknown public key for %q", c.User())
 		},
 	}
