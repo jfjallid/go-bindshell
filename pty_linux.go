@@ -1,7 +1,6 @@
 package main
 
 import (
-	log "github.com/jfjallid/golog"
 	"os"
 	"os/exec"
 	//"os/signal"
@@ -10,6 +9,7 @@ import (
 	"io"
 	"strconv"
 )
+
 
 func newPTY() (ptm, pts *os.File, err error) {
 	ptm, err = os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
