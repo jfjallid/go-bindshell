@@ -1,8 +1,9 @@
 package main
 
 /*
-An authenticated bind shell using SSH and public key authentication
-with support for dynamic (socks) and static port forwarding
+An authenticated bind shell built upon SSH with support for dynamic (socks)
+and static port forwarding.
+Supports certificate, public key, and password authentication.
 Due to some dependencies on spawning a PTY, this will only work on linux
 distributions. Limitations are in the opening of the /dev/ptmx device.
 
@@ -14,21 +15,18 @@ Jimmy Fjällid
 */
 
 import (
-	"fmt"
-	"strconv"
-
-	"github.com/jfjallid/golog"
-
 	_ "embed"
+	"fmt"
+	"github.com/jfjallid/golog"
 	"os"
+	"strconv"
 	"time"
 )
 
 var (
-    bindPortStr = "2022"
-    log = golog.Get("")
+	bindPortStr = "2022"
+	log         = golog.Get("")
 )
-
 
 func watchdog(duration time.Duration) {
 	t := time.NewTimer(duration)
@@ -63,13 +61,13 @@ func main() {
 
 	log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 	log.SetLogLevel(golog.LevelNotice)
-	//log.SetLogLevel(log.LevelDebug)
+	//log.SetLogLevel(golog.LevelDebug)
 
-    bindPort, err := strconv.Atoi(bindPortStr)
-    if err != nil {
-        log.Errorln(err)
-        return
-    }
+	bindPort, err := strconv.Atoi(bindPortStr)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
 
-    NewServer(fmt.Sprintf("0.0.0.0:%d", bindPort))
+	NewServer(fmt.Sprintf("0.0.0.0:%d", bindPort))
 }

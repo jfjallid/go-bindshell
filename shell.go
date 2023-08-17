@@ -5,17 +5,17 @@ package main
 import (
 	"golang.org/x/crypto/ssh"
 	//"os/signal"
-	"syscall"
-    "encoding/binary"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os/exec"
-    "fmt"
+	"syscall"
 )
 
 func init() {
-      features["shell"] = spawnShell
-      features["exec"] = execCommand
-      features["pty-req"] = handlePTYReq
+	features["shell"] = spawnShell
+	features["exec"] = execCommand
+	features["pty-req"] = handlePTYReq
 }
 
 func spawnShell(self *Client) (res bool, reply []byte) {
@@ -118,7 +118,6 @@ func execCommand(self *Client, payload []byte) {
 	log.Debugf("Client '%s': Spawned process exited\n", self.identifier)
 }
 
-
 func runCommand(self *Client, args []string) (cmd *exec.Cmd, err error) {
 	if len(args) == 0 {
 		// No args so a normal shell
@@ -180,12 +179,12 @@ func handlePTYReq(self *Client, payload []byte) (bool, []byte) {
 	pr := ptyRequestMsg{}
 	if err := ssh.Unmarshal(payload, &pr); err != nil {
 		log.Errorf("Client '%s': Failed to parse pty-req payload: %v\n", self.identifier, err)
-        return false, nil
+		return false, nil
 	}
 	log.Debugf("Client '%s': Received request to allocated a PTY with term: %s\n", self.identifier, pr.Term)
 	if self.ptm != nil {
 		log.Noticef("Client '%s': Received another request to spawn pty. Ignoring.\n", self.identifier)
-        return false, nil
+		return false, nil
 	}
 	// Sanity check of the passed term
 	if termRegex.MatchString(pr.Term) {
@@ -206,10 +205,10 @@ func handlePTYReq(self *Client, payload []byte) (bool, []byte) {
 	ptm, pts, err := newPTY()
 	if err != nil {
 		log.Errorf("Client '%s': Failed to spawn new PTY: %v\n", self.identifier, err)
-        return false, nil
+		return false, nil
 	}
 	self.ptm = ptm
 	self.pts = pts
 
-    return true, nil
+	return true, nil
 }
