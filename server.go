@@ -144,7 +144,6 @@ func (self *Client) handleRequests(in <-chan *ssh.Request) {
 			// Read dimensions from payload
 			self.ws.Col = uint16(binary.BigEndian.Uint32(req.Payload[0:4]))
 			self.ws.Row = uint16(binary.BigEndian.Uint32(req.Payload[4:8]))
-			//self.wsch <- syscall.SIGWINCH
 			self.wsch <- MYSIGWINCH
 		case "exec":
 			log.Debugf("Client '%s': Received exec request: %v\n", self.identifier, req)
@@ -183,7 +182,6 @@ func (c *Client) handleNewChannels(chans <-chan ssh.NewChannel) {
 			c.sessionChan = channel
 			// Could this defer statement be called before it is time?
 			// e.g., could the "chans" channel be closed before the connection is closed?
-			//defer c.sessionChan.Close()
 			defer func() {
 				c.sessionChan.Close()
 				log.Debugf("Client '%s': Closed session channel\n", c.identifier)
@@ -419,36 +417,45 @@ func NewServer(bindAddr string) {
 			return ""
 		},
 		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
-			log.Infof("Auth attempt for (%s) with method: (%s) and error: %v\n", conn.User(), method, err)
+			if err != nil {
+				log.Noticef("Auth attempt from (%s) for (%s) with method: (%s) and error: %v\n", conn.RemoteAddr().String(), conn.User(), method, err)
+			}
 		},
 	}
 
 	if val, ok := features["ca"]; ok {
+		var caPubkey *ssh.PublicKey
+		var crl map[string]int
 		// Use CA host cert if available
-		fn := val.(func() (ssh.Signer, *ssh.PublicKey, error))
-		hostCert, caPubkey, err := fn()
+		fn := val.(func() (ssh.Signer, *ssh.PublicKey, map[string]int, error))
+		hostKey, caPubkey, crl, err = fn()
 		if err != nil {
 			log.Errorln(err)
 			return
 		}
-		hostKey = hostCert
 		caFingerPrint := ssh.FingerprintSHA256(*caPubkey)
 		checker.IsUserAuthority = func(auth ssh.PublicKey) bool {
 			if ssh.FingerprintSHA256(auth) == caFingerPrint {
-				log.Debugln("Certificate signing key trusted")
+				log.Debugf("Certificate signed by trusted CA using key with fingerprint %s\n", ssh.FingerprintSHA256(auth))
 				return true
 			} else {
-				log.Debugln("Certificate signing key NOT trusted!")
+				log.Debugf("Certificate NOT signed by trusted CA with fingerprint %s\n", ssh.FingerprintSHA256(auth))
 			}
 			return false
 		}
 		checker.IsRevoked = func(cert *ssh.Certificate) bool {
-			// Could implement support for checking certificate serial number against some revocation list
+			// The SSH package lacks functionality to handle KRL files so for now there is only a basic check
+			// against a list of fingerprints combined with serial numbers that are revoked.
 			// Save certificate
+			if val, ok := crl[ssh.FingerprintSHA256(cert.Key)]; ok {
+				if val >= int(cert.Serial) {
+					log.Noticef("Certificate is REVOKED with fingerprint: %s and serial: %d\n", ssh.FingerprintSHA256(cert.Key), cert.Serial)
+					return true
+				}
+			}
 			return false
 		}
 
-		//config.PublicKeyCallback = checker.Authenticate
 		// Using a customized checker.Authenticate() to store certificate identity
 		config.PublicKeyCallback = func(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			cert, ok := pubKey.(*ssh.Certificate)
@@ -553,7 +560,7 @@ func NewServer(bindAddr string) {
 			nConn.Close()
 			continue
 		}
-		//NOTE There will likely be a clash if two clients request the same reverse port forward
+		//NOTE There will be a clash if two clients request the same reverse port forward
 		// Perhaps keep track globally of reverse forwards in use instead of attempting to open second one and failing?
 		c := Client{
 			conn:                    conn,

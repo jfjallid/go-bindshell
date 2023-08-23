@@ -51,16 +51,16 @@ func main() {
 	//        return
 	//    }
 
-	// Run max 1 week
-	watchdogDuration, err := time.ParseDuration("168h")
-	if err != nil {
-		log.Criticalln(err)
-		return
-	}
-	go watchdog(watchdogDuration)
+	//// Run max 1 week
+	//watchdogDuration, err := time.ParseDuration("168h")
+	//if err != nil {
+	//	log.Criticalln(err)
+	//	return
+	//}
+	//go watchdog(watchdogDuration)
 
-	log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 	log.SetLogLevel(golog.LevelNotice)
+	//log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 	//log.SetLogLevel(golog.LevelDebug)
 
 	bindPort, err := strconv.Atoi(bindPortStr)

@@ -17,10 +17,10 @@ shellonly:
 	GOOS=windows GOARCH=386 go build -tags shell,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}" -o bindshell.exe .
 
 forwardonly:
-	#GOOS=linux GOARCH=amd64 go build -tags portforwards,certauth,pubkeyauth,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}"
+	GOOS=linux GOARCH=amd64 go build -tags portforwards,certauth,pubkeyauth,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}"
 	#GOOS=windows GOARCH=386 go build -tags portforwards,certauth,pubkeyauth,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}" -o bindshell.exe .
-	GOOS=linux GOARCH=amd64 go build -tags portforwards,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}"
-	GOOS=windows GOARCH=386 go build -tags portforwards,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}" -o bindshell.exe .
+	#GOOS=linux GOARCH=amd64 go build -tags portforwards,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}"
+	#GOOS=windows GOARCH=386 go build -tags portforwards,passauth -ldflags "-s -w -X main.bindPortStr=${BINDPORT}" -o bindshell.exe .
 
 clean:
 	rm -f bindshell

@@ -3,70 +3,78 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	_ "embed"
-	"encoding/pem"
-
 	"golang.org/x/crypto/ssh"
+	"regexp"
+	"strconv"
+	"strings"
 )
 
 func init() {
-	features["ca"] = genCAHostKey
+	features["ca"] = getCerts
 }
 
-//go:embed ca
-var caPrivKeyBytes []byte
+//go:embed ca.pub
+var caPubKeyBytes []byte
 
-func genCAHostKey() (cert ssh.Signer, ca *ssh.PublicKey, err error) {
+//go:embed host
+var hostPrivKeyBytes []byte
 
-	caPrivKey, err := ssh.ParsePrivateKey(caPrivKeyBytes)
+//go:embed host-cert.pub
+var hostCertBytes []byte
+
+//go:embed revokedCerts
+var revocationListBytes []byte
+
+var lineBreakRegExp = regexp.MustCompile(`\r?\n`)
+
+func getCerts() (cert ssh.Signer, ca *ssh.PublicKey, crl map[string]int, err error) {
+
+	// Read ca pubkey from disk to use for cert validation
+	caPubKey, _, _, _, err := ssh.ParseAuthorizedKey(caPubKeyBytes)
 	if err != nil {
-		log.Criticalf("Failed to parse CA private key with error: %v\n", err)
+		log.Errorf("%s\n", caPubKeyBytes)
+		log.Criticalf("Failed to parse CA public key with error: %v\n", err)
 		return
 	}
-	caPubKey := caPrivKey.PublicKey()
 	ca = &caPubKey
 
-	privateRSAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// Read server privkey from disk
+	hostPrivKey, err := ssh.ParsePrivateKey(hostPrivKeyBytes)
 	if err != nil {
-		log.Criticalf("Failed to gen privateKey: %v", err)
+		log.Criticalf("Failed to parse Host private key with error: %v\n", err)
 		return
 	}
 
-	sshPubKey, err := ssh.NewPublicKey(&privateRSAKey.PublicKey)
+	// Load server certificate
+	hostPubKey, _, _, _, err := ssh.ParseAuthorizedKey(hostCertBytes)
 	if err != nil {
-		log.Criticalf("Failed to create ssh public key: %v", err)
+		log.Criticalf("Failed to parse host certificate with error: %v\n", err)
 		return
 	}
 
-	hostCert := &ssh.Certificate{
-		Key:             sshPubKey,
-		CertType:        ssh.HostCert,
-		KeyId:           "server",
-		ValidPrincipals: []string{}, // Add hostname to restrict to only a single valid hostname
-	}
-
-	err = hostCert.SignCert(rand.Reader, caPrivKey)
+	// Create a signer from the server ssh cert and privkey
+	cert, err = ssh.NewCertSigner(hostPubKey.(*ssh.Certificate), hostPrivKey)
 	if err != nil {
-		log.Criticalf("Failed to sign host cert: %v\n", err)
+		log.Criticalf("Failed to create certificate signer with error: %v\n", err)
 		return
 	}
 
-	pemdata := pem.EncodeToMemory(
-		&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(privateRSAKey),
-		},
-	)
-	privateHostKey, err := ssh.ParsePrivateKey(pemdata)
-	if err != nil {
-		log.Criticalf("Failed to parse private key: %v", err)
-		return
+	// Get list of revoked certificates
+	crl = make(map[string]int)
+
+	lines := lineBreakRegExp.Split(string(revocationListBytes), -1)
+	for _, line := range lines {
+		if line != "" {
+			parts := strings.Split(line, ",")
+			crl[parts[0]], err = strconv.Atoi(parts[1])
+			if err != nil {
+				log.Errorln(err)
+			}
+		}
 	}
 
-	cert, err = ssh.NewCertSigner(hostCert, privateHostKey)
+	log.Debugf("Using a certificate revocation map of: %v\n", crl)
 
 	return
 }
