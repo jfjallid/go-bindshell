@@ -29,8 +29,8 @@ type permissions struct {
 	pty                 bool
 	allowForward        bool
 	allowReverseForward bool
-	allowedOpen         map[int]net.IPAddr
-	allowedListen       map[int]net.IPAddr
+	allowedOpen         map[int]net.IP
+	allowedListen       map[int]net.IP
 	restrict            bool
 }
 
@@ -257,9 +257,29 @@ func (self *Client) handleOOCRequests(in <-chan *ssh.Request) {
 	}
 }
 
+/*
+1. permitlisten has three valid forms according to the manual for ssh config:
+permitlisten <port>
+permitlisten <host:<port>
+permitlisten <any>|<none>
+2. permitopen has two valid forms:
+permitopen <host>:<port>
+permitopen any|none
+<port> can be a number or an asterix (*) to include all ports
+If a single portnumber is specified, restrict everything except that port.
+Note however, that multiple permitlisten and permitopen statements might be provided
+to include many ports in the exception.
+If "any" is used, allow all local/reverse port forwarding
+If "none" is used, disable reverse/local port forwarding
+*/
 func (c *Client) parsePubkeyOptions(list []string) {
-	explitNoForward := false
+	explicitNoForward := false
 	explicitNoPty := false
+	explicitPty := false
+	explicitAllowLocalForward := false
+	explicitNoLocalForward := false
+	explicitAllowListen := false
+	explicitNoListen := false
 	for _, item := range list {
 		parts := strings.Split(item, "=")
 		switch parts[0] {
@@ -268,95 +288,178 @@ func (c *Client) parsePubkeyOptions(list []string) {
 		case "no-pty":
 			explicitNoPty = true
 		case "no-port-forwarding":
-			explitNoForward = true
+			explicitNoForward = true
+		case "pty":
+			explicitPty = true
 		case "permitlisten":
 			if len(parts) > 1 {
-				ip, port, err := parseAddr(parts[1])
-				if err != nil {
-					log.Debugf("Failed to parse Authorized_keys option permitlisten with argument: (%s)\n", parts[1])
-					continue
+				upper := strings.ToUpper(parts[1])
+				if upper == "ANY" {
+					explicitAllowListen = true
+				} else if upper == "NONE" {
+					explicitNoListen = true
+				} else {
+					ip, port, err := parseAddr(parts[1])
+					if err != nil {
+						log.Errorf("Failed to parse Authorized_keys option permitlisten with argument: (%s)\n", parts[1])
+						continue
+					}
+					if (ip.String() == "0.0.0.0") && (port == 0) {
+						explicitAllowListen = true
+					} else {
+						c.privs.allowedListen[port] = ip
+					}
 				}
-				c.privs.allowedListen[port] = *ip
 			}
 		case "permitopen":
-			c.privs.pty = true
+			//c.privs.pty = true
 			if len(parts) > 1 {
-				ip, port, err := parseAddr(parts[1])
-				if err != nil {
-					log.Debugf("Failed to parse Authorized_keys option permitopen with argument: (%s)\n", parts[1])
-					continue
+				upper := strings.ToUpper(parts[1])
+				if upper == "ANY" {
+					explicitAllowLocalForward = true
+				} else if upper == "NONE" {
+					explicitNoLocalForward = true
+				} else {
+					ip, port, err := parseAddr(parts[1])
+					if err != nil {
+						log.Errorf("Failed to parse Authorized_keys option permitopen with argument: (%s)\n", parts[1])
+						continue
+					}
+					c.privs.allowedOpen[port] = ip
 				}
-				c.privs.allowedOpen[port] = *ip
 			}
 		default:
 		}
 	}
 	/*
-	   If restrict, then block everything by default and only allow what is explicitly allowed
-	   If explit no forward, then block forward, otherwise allow port forward unless restrict.
+		   If restrict, then block everything by default and only allow what is explicitly allowed
+	       If explit no-whatever, then block it, otherwise allow it by default unless restrict
 	*/
-	if !c.privs.restrict {
-		if !explicitNoPty {
-			c.privs.pty = true
-		}
-		if !explitNoForward {
-			c.privs.allowForward = true
-			c.privs.allowReverseForward = true
-		}
+	// Examine Local forward
+	if explicitNoLocalForward {
+		c.privs.allowForward = false
+	} else if c.privs.restrict && !explicitAllowLocalForward {
+		c.privs.allowForward = false
 	}
-	/* TODO Handle cases
-	   1. Only want to allow a few specific port for listen or open
-	   2. Don't want to allow any port forwards
-	*/
-	if !explitNoForward {
-		c.privs.allowForward = true
-		c.privs.allowReverseForward = true
+	// Examine Reverse forward
+	if explicitNoListen {
+		c.privs.allowReverseForward = false
+	} else if c.privs.restrict && !explicitAllowListen {
+		c.privs.allowReverseForward = false
 	}
-	if !explicitNoPty {
+	// Examine general port forwarding
+	if explicitNoForward {
+		// This supercedes any specific allow grants
+		// as such we must remove any entries from the allow-maps
+		c.privs.allowForward = false
+		c.privs.allowReverseForward = false
+		c.privs.allowedOpen = make(map[int]net.IP)
+		c.privs.allowedListen = make(map[int]net.IP)
+	}
+	// Examine other privs
+	if (c.privs.restrict && !explicitPty) || explicitNoPty {
+		c.privs.pty = false
+	} else {
+		// Allow PTY per default
 		c.privs.pty = true
 	}
 }
 
 func (c *Client) parsePermissions(extensions, criticalOptions map[string]string) {
-	// Default to allow everything unless specifically denied
-	c.privs.allowForward = true
-	c.privs.allowReverseForward = true
-	c.privs.pty = true
+	/*
+	   Supported options:
+	   permit-port-forwarding, permit-pty
+	   Default is that everything is denied unless explicitly allowed
+	   permit-port-forwarding will allow everything in both directions
+	   There is also support for two custom extensions permitlistenN and permitopenN
+	   where N is an incrementing integer for each additional rule of the same type.
+	   This is to handle the limitation that a certificate extension name must be unique.
+	   permitlistenN and permitopenN will allow single port and addresses unless wildcards are used
+	   same as in parsePubkeyOptions function
+	*/
+	explicitNoLocalForward := false
+	explicitNoListen := false
 
-	for key, _ := range criticalOptions {
-		switch key {
-		case "no-port-forwarding":
-			c.privs.allowForward = false
-			c.privs.allowReverseForward = false
-		case "no-pty":
-			c.privs.pty = false
+	for key, val := range extensions {
+		switch {
+		case key == "permit-port-forwarding":
+			c.privs.allowReverseForward = true
+			c.privs.allowForward = true
+		case key == "permit-pty":
+			c.privs.pty = true
+		case strings.HasPrefix(key, "permitlisten"):
+			log.Debugf("Parsing permitlisten: %s\n", val)
+			upper := strings.ToUpper(val)
+			if upper == "ANY" {
+				c.privs.allowReverseForward = true
+			} else if upper == "NONE" {
+				explicitNoListen = true
+			} else {
+				ip, port, err := parseAddr(val)
+				if err != nil {
+					log.Errorf("Failed to parse certificate extension permitlisten with argument: (%s)\n", val)
+					continue
+				}
+				if (ip.String() == "0.0.0.0") && (port == 0) {
+					c.privs.allowReverseForward = true
+				} else {
+					c.privs.allowedListen[port] = ip
+				}
+			}
+		case strings.HasPrefix(key, "permitopen"):
+			log.Debugf("Parsing permitopen: %s\n", val)
+			upper := strings.ToUpper(val)
+			if upper == "ANY" {
+				c.privs.allowForward = true
+			} else if upper == "NONE" {
+				explicitNoLocalForward = true
+			} else {
+				ip, port, err := parseAddr(val)
+				if err != nil {
+					log.Errorf("Failed to parse certificate extension permitopen with argument: (%s)\n", val)
+					continue
+				}
+				c.privs.allowedOpen[port] = ip
+			}
 		default:
 		}
 	}
-	for key, _ := range extensions {
-		switch key {
-		case "no-port-forwarding":
-			c.privs.allowForward = false
-			c.privs.allowReverseForward = false
-		case "no-pty":
-			c.privs.pty = false
-		default:
-		}
+	// Examine Local forward
+	if explicitNoLocalForward {
+		// Override with block
+		c.privs.allowForward = false
+		c.privs.allowedOpen = make(map[int]net.IP)
+	}
+	// Examine Reverse forward
+	if explicitNoListen {
+		// Override with block
+		c.privs.allowReverseForward = false
+		c.privs.allowedListen = make(map[int]net.IP)
 	}
 }
 
-func parseAddr(s string) (ip *net.IPAddr, port int, err error) {
+/*
+Parsing arguments of PermitOpen and PermitListen
+Arguements can have the form:
+PermitListen <port> - Allow listener on localhost for <port>
+PermitListen <host>:<port> Allow listner on <host>:<port>
+PermitOpen <host>:<port> - Allow forward request to <host>:<port>
+where:
+<port> can be a number or * to allow all ports
+<host> can be and ipv4 address or * to allow all addresses
+*/
+func parseAddr(s string) (ip net.IP, port int, err error) {
 	// localhost:*
 	// localhost:1234
 	// 0.0.0.0:2222
-	// [::1]:*
-	// [::1]:2323
+	port = 0 // Means any port and is used if portStr == "*"
 	i := strings.LastIndex(s, ":")
 	if i == -1 {
-		err = fmt.Errorf("Invalid format of address")
+		// Only allow localhost and port specified
+		ip = net.ParseIP("127.0.0.1")
+		port, err = strconv.Atoi(s)
 		return
 	}
-	port = -1 // Means any port
 	addrStr := s[:i]
 	portStr := s[i+1:]
 	if portStr != "*" {
@@ -364,22 +467,20 @@ func parseAddr(s string) (ip *net.IPAddr, port int, err error) {
 		port, err = strconv.Atoi(portStr)
 		if err != nil {
 			return
-		} else if port < 0 {
-			err = fmt.Errorf("Invalid port")
+		} else if port < 1 {
+			err = fmt.Errorf("Invalid port. Must be between 1-65535")
 			return
 		}
 	}
 	if addrStr == "localhost" {
-		ip, err = net.ResolveIPAddr("tcp", "127.0.0.1")
+		ip = net.ParseIP("127.0.0.1")
 		if err != nil {
 			return
 		}
 	} else {
-		ip, err = net.ResolveIPAddr("tcp", addrStr)
-		if err != nil {
-			return
-		}
+		ip = net.ParseIP(addrStr)
 	}
+	log.Debugf("ParseAddr returns ip: %s, port: %d, err: %v\n", ip, port, err)
 	return ip, port, nil
 }
 
@@ -568,8 +669,8 @@ func NewServer(bindAddr string) {
 			reverseForwards:         make(map[string]net.Listener),
 			reverseForwardListeners: make(map[net.Listener]string),
 			privs: permissions{
-				allowedListen: make(map[int]net.IPAddr),
-				allowedOpen:   make(map[int]net.IPAddr),
+				allowedListen: make(map[int]net.IP),
+				allowedOpen:   make(map[int]net.IP),
 			},
 		}
 		if conn.Permissions != nil {
@@ -581,7 +682,7 @@ func NewServer(bindAddr string) {
 				log.Noticef("Client '%s' logged in with password.\n", c.identifier)
 			}
 			c.parsePermissions(conn.Permissions.Extensions, conn.Permissions.CriticalOptions)
-			log.Debugf("User has the following permissions: %#v\n", c.privs)
+			log.Debugf("User has the following permissions: Pty: %v, Allow general local forward: %v, Allow general reverse forward: %v, Allow specific local forward: %v, Allow specific reverse forward: %v\n", c.privs.pty, c.privs.allowForward, c.privs.allowReverseForward, c.privs.allowedOpen, c.privs.allowedListen)
 		} else {
 			log.Noticef("Client '%s' logged in without setting permissions\n", c.identifier)
 		}

@@ -36,20 +36,6 @@ func watchdog(duration time.Duration) {
 }
 
 func main() {
-	//    // Don't run after
-	//    longForm := "Jan 2, 2006 at 3:04pm (MST)"
-	//    tPree, err := time.Parse(longForm, "Feb 17, 2023 at 11:45am (CET)")
-	//    if err != nil {
-	//        return
-	//    }
-	//    tAfter, err := time.Parse(longForm, "Feb 17, 2023 at 4:00pm (CET)")
-	//    if err != nil {
-	//        return
-	//    }
-	//    currentTime := time.Now()
-	//    if (currentTime.After(tAfter)) || (currentTime.Before(tPree)) {
-	//        return
-	//    }
 
 	//// Run max 1 week
 	//watchdogDuration, err := time.ParseDuration("168h")

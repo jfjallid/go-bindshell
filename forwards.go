@@ -14,6 +14,84 @@ func init() {
 	features["tcpip-forward"] = createReverseForward
 }
 
+func checkReverseForward(c *Client, r *reverseForwardRequest) bool {
+	// If not granted the general "allow reverse forward", there might still be specific
+	// addresses that are allowed
+	// Important to check both against any port and specific port as there might be two permitlisten statements with different addresses
+	if !c.privs.allowReverseForward {
+		// Check if any port is allowed
+		addr, ok := c.privs.allowedListen[0]
+		// Check if specific port is allowed
+		addr2, ok2 := c.privs.allowedListen[int(r.BindPort)]
+		if !ok && !ok2 {
+			// No default allow and no specific address allow
+			return false
+		} else if ok && !ok2 {
+			// Only wildcard port
+			if addr.String() != r.BindAddr {
+				log.Noticef("Reverse portforward with bind addr %s was attempted but only %s is allowed\n", r.BindAddr, addr.String())
+				return false
+			}
+			// Matched against wildcard port allow
+		} else if !ok && ok2 {
+			// Only specific port
+			if (addr2.String() != r.BindAddr) && (addr2.String() != "0.0.0.0") {
+				log.Noticef("Reverse portforward with bind addr %s was attempted but only %s is allowed\n", r.BindAddr, addr2.String())
+				return false
+			}
+			// Matched against specific port allow
+		} else {
+			// Two possibilities to get okey
+			if (addr.String() != r.BindAddr) && (addr2.String() != r.BindAddr) && (addr2.String() != "0.0.0.0") {
+				log.Noticef("Reverse portforward with bind addr %s was attempted but only %s and %s are allowed\n", r.BindAddr, addr.String(), addr2.String())
+				return false
+			}
+			// Matched against either wildcard or specific port allow
+		}
+	}
+	// Allowed
+	return true
+}
+
+func checkLocalForward(c *Client, d *localForwardChannelData) bool {
+	// If not granted the general "allow local forward", there might still be specific
+	// addresses that are allowed
+	// Important to check both against any port and specific port as there might be two permitopen statements with different addresses
+	if !c.privs.allowForward {
+		// Check if any port is allowed
+		addr, ok := c.privs.allowedOpen[0]
+		// Check if specific port is allowed
+		addr2, ok2 := c.privs.allowedOpen[int(d.DestPort)]
+		if !ok && !ok2 {
+			// No default allow and no specific address allow
+			return false
+		} else if ok && !ok2 {
+			// Only wildcard port
+			if addr.String() != d.DestHost {
+				log.Noticef("Portforward for %s:%d was attempted but only to %s:%d is allowed\n", d.DestHost, d.DestPort, addr.String(), "*")
+				return false
+			}
+			// Matched against wildcard port allow
+		} else if !ok && ok2 {
+			// Only specific port
+			if (addr2.String() != d.DestHost) && (addr2.String() != "0.0.0.0") {
+				log.Noticef("Portforward for %s:%d was attempted but only to %s:%d is allowed\n", d.DestHost, d.DestPort, addr2.String(), d.DestPort)
+				return false
+			}
+			// Matched against specific port allow
+		} else {
+			// Two possibilities to get okey
+			if (addr.String() != d.DestHost) && (addr2.String() != d.DestHost) && (addr2.String() != "0.0.0.0") {
+				log.Noticef("Portforward for %s:%d was attempted but only to %s:%d and %s:%d are allowed\n", d.DestHost, d.DestPort, addr.String(), "*", addr2.String(), d.DestPort)
+				return false
+			}
+			// Matched against either wildcard or specific port allow
+		}
+	}
+	// Allowed
+	return true
+}
+
 func createReverseForward(c *Client, payload []byte) (bool, []byte) {
 	// Wants a response
 	r := reverseForwardRequest{}
@@ -22,26 +100,19 @@ func createReverseForward(c *Client, payload []byte) (bool, []byte) {
 		return false, nil
 	}
 
-	// If not granted the general "allow reverse forward", there might still be specific
-	// addresses that are allowed
-	if !c.privs.allowReverseForward {
-		if addr, ok := c.privs.allowedListen[int(r.BindPort)]; !ok {
-			// No default allow and no specific address allow
-			return false, nil
-		} else {
-			if r.BindAddr != addr.String() {
-				log.Noticef("Reverse portforward with bind addr %s was attempted but only %s is allowed\n", r.BindAddr, addr.String())
-				return false, nil
-			}
-		}
+	// Check if allowed
+	if !checkReverseForward(c, &r) {
+		return false, nil
 	}
 
 	// Check if addr is domain name or ip. Probably limit to only support ipv4 addresses
 	// Optionally limit to only listen on localhost?
 	log.Debugf("Client '%s':tcpip-forward with bindaddr: %s\n", c.identifier, r.BindAddr)
 	if r.BindAddr == "" {
-		r.BindAddr = "0.0.0.0"
+		// Default to listen only on localhost
+		r.BindAddr = "127.0.0.1"
 	} else {
+		log.Debugf("r.BindAddr: %s, r.BindPort: %d\n", r.BindAddr, r.BindPort)
 		bindIP := net.ParseIP(r.BindAddr)
 		if bindIP == nil {
 			if r.BindAddr == "localhost" {
@@ -186,21 +257,14 @@ func handleForward(c *Client, newChannel ssh.NewChannel) {
 		newChannel.Reject(ssh.ConnectionFailed, "error parsing forward data: "+err.Error())
 		return
 	}
-	if !c.privs.allowForward {
-		if addr, ok := c.privs.allowedOpen[int(d.DestPort)]; !ok {
-			newChannel.Reject(ssh.ConnectionFailed, "Portforward not allowed")
-			return
-		} else {
-			if d.DestHost != addr.String() {
-				log.Noticef("Portforward for %s was attempted but only to %s is allowed\n", d.DestHost, addr.String())
-				newChannel.Reject(ssh.ConnectionFailed, "Portforward not allowed")
-				return
-			}
-		}
+
+	// Check if allowed
+	if !checkLocalForward(c, &d) {
+		newChannel.Reject(ssh.ConnectionFailed, "Portforward not allowed")
+		return
 	}
 
 	log.Debugf("Received direct-tcpip request with to %s:%d from %s:%d\n", d.DestHost, d.DestPort, d.OriginHost, d.OriginPort)
-	//TODO determine if I want to forward data e.g., perhaps only allow certain destinations?
 	destIP := net.ParseIP(d.DestHost)
 	if (destIP == nil) && (d.DestHost != "localhost") {
 		// Hostname or invalid ip
