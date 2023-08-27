@@ -280,6 +280,12 @@ func (c *Client) parsePubkeyOptions(list []string) {
 	explicitNoLocalForward := false
 	explicitAllowListen := false
 	explicitNoListen := false
+
+	// Begin with all permissions enabled
+	c.privs.allowForward = true
+	c.privs.allowReverseForward = true
+	c.privs.pty = true
+
 	for _, item := range list {
 		parts := strings.Split(item, "=")
 		switch parts[0] {
@@ -332,21 +338,26 @@ func (c *Client) parsePubkeyOptions(list []string) {
 		}
 	}
 	/*
-		   If restrict, then block everything by default and only allow what is explicitly allowed
-	       If explit no-whatever, then block it, otherwise allow it by default unless restrict
+			   If restrict, then block everything by default and only allow what is explicitly allowed
+		       If explit no-whatever, then block it, otherwise allow it by default unless restrict
 	*/
 	// Examine Local forward
 	if explicitNoLocalForward {
 		c.privs.allowForward = false
+		// Override any specific allows
+		c.privs.allowedOpen = make(map[int]net.IP)
 	} else if c.privs.restrict && !explicitAllowLocalForward {
 		c.privs.allowForward = false
 	}
 	// Examine Reverse forward
 	if explicitNoListen {
 		c.privs.allowReverseForward = false
+		// Override any specific allows
+		c.privs.allowedListen = make(map[int]net.IP)
 	} else if c.privs.restrict && !explicitAllowListen {
 		c.privs.allowReverseForward = false
 	}
+
 	// Examine general port forwarding
 	if explicitNoForward {
 		// This supercedes any specific allow grants

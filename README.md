@@ -117,3 +117,11 @@ certificates:
 
 permitlisten and permitopen can be supplied with the single value "any" or
 "none" to enable or disable all local and reverse forwards respectively.
+
+## Unit testing
+Only a few unit tests are implemented so far that focus on the parsing of
+certificate and pubkey permissions and on checks to allow port forwards.
+
+To run a unit test:
+
+go test -tags=portforwards
